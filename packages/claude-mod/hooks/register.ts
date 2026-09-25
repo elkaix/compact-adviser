@@ -113,9 +113,10 @@ function skipText(skip: Skip): string {
 
 /** What a judged turn end came to: its verdict's resolution, or how that went wrong. */
 const OUTCOME_TEXT: Readonly<
-  Record<Resolution | "pending" | "failed" | "compaction-failed", string>
+  Record<Resolution | "pending" | "asked" | "failed" | "compaction-failed", string>
 > = {
   pending: "being judged",
+  asked: "being judged",
   failed: "the judgment failed; context left unchanged",
   discard: "judgment discarded, settings or session changed meanwhile",
   wait: "judged, not a checkpoint yet",
@@ -252,14 +253,17 @@ function judgeFailureMessage(error: unknown): string {
 }
 
 /**
- * This session's request log, or undefined without HOME: request bodies carry transcript
- * text, so they are never written into the working directory instead.
+ * This session's request log (the part it appends to, unless `part` names another), or
+ * undefined without HOME: request bodies carry transcript text, so they are never written
+ * into the working directory instead.
  */
-async function sessionLogPath($: EngineInterface, part = logPart): Promise<string | undefined> {
+async function sessionLogPath($: EngineInterface, part?: number): Promise<string | undefined> {
   const home = await $.env.get("HOME");
   if (home === undefined || home.trim() === "") return undefined;
+  if (part === undefined) await resumeLogPart($);
+  const current = part ?? logPart;
   const path = requestLogPath(home, await $.session.id());
-  return part === 1 ? path : path.replace(/\.jsonl$/, `.${part}.jsonl`);
+  return current === 1 ? path : path.replace(/\.jsonl$/, `.${current}.jsonl`);
 }
 
 /** `$.fs.read` refuses files over 4 MiB; a log part stops growing before it gets there. */
@@ -310,7 +314,6 @@ async function appendTypeSafeLog($: EngineInterface, line: string): Promise<void
 
 async function requestLogStatus($: EngineInterface, config: Config): Promise<string> {
   if (!config.logRequests) return "off";
-  await resumeLogPart($);
   return logProblem ?? (await sessionLogPath($)) ?? "unavailable, HOME is not set";
 }
 
@@ -333,10 +336,14 @@ function clearStatus($: EngineInterface): void {
   if (interactive) $.ui.status(undefined);
 }
 
-/** Makes any judgment in flight stale; the turn end it was judging no longer reads as pending. */
-function supersede(): void {
+/**
+ * Makes any judgment in flight stale; the turn end it was judging no longer reads as pending.
+ * `why` names the gate that stops it: an asked judgment is discarded, an unasked one not checked.
+ */
+function supersede(why?: Skip): void {
   generation++;
-  if (lastCheck === "pending") lastCheck = "discard";
+  if (lastCheck === "asked") lastCheck = why === undefined ? "discard" : `discarded:${why}`;
+  else if (lastCheck === "pending") lastCheck = why ?? "discard";
 }
 
 async function invalidate($: EngineInterface): Promise<void> {
@@ -455,6 +462,7 @@ async function judgeCheckpoint($: EngineInterface, epoch: number): Promise<void>
         // Request logging must not replace or delay the judgment.
       }
     }
+    note(epoch, "asked");
     let result: Awaited<ReturnType<typeof judge>>;
     try {
       const endpoint = await judgeEndpoint($);
@@ -988,7 +996,7 @@ export const register: Register = (on, options) => {
     if (e.trigger === "precompute" || e.agentId !== undefined) return next(e);
     if (!(await isActivated($)) || !interactive) return next(e);
     // A judgment in flight is stale either way, and none may hint or compact until this ends.
-    supersede();
+    supersede("compacting");
     compactions++;
     let result: Awaited<ReturnType<typeof next>>;
     try {
