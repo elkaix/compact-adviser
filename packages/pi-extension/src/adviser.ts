@@ -213,7 +213,7 @@ export function installAdviser(pi: ExtensionAPI, options: Options): void {
         controller.signal,
         profile,
       );
-      if (!current()) return;
+      // Every answered request gets its outcome logged, even one a newer turn has made stale.
       if (config.logRequests) {
         try {
           appendResponseLog(
@@ -227,6 +227,7 @@ export function installAdviser(pi: ExtensionAPI, options: Options): void {
           // Response logging must not replace the gate decision.
         }
       }
+      if (!current()) return;
       // No await between this final cross-session configuration/state check and compact().
       const latest = store.read();
       const judgedTokens = eligible(ctx, latest, state);
@@ -282,14 +283,15 @@ export function installAdviser(pi: ExtensionAPI, options: Options): void {
         });
       }
     } catch (error) {
-      if (!current()) return;
-      if (config.logRequests) {
+      // A request this module cancelled has no TypeSafe outcome to log.
+      if (config.logRequests && !controller.signal.aborted) {
         try {
           appendErrorLog(options.agentDir, error, loggedBody);
         } catch {
           // Error logging must not replace backoff.
         }
       }
+      if (!current()) return;
       const failures = Math.min(state.failures + 1, 6);
       persist({ ...state, failures, retryAfter: now() + Math.min(300000, 5000 * 2 ** failures) });
       notice(
