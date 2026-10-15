@@ -19,10 +19,10 @@ export const REASK_MIN_TOKENS = 5000;
 /**
  * The person's context budget (a positive token count) when the hint floor measures against it
  * instead of the host's own limit, otherwise 0: a budget only relaxes the floor, so it applies
- * when it is below the limit or the limit is unknown.
+ * when it is below the limit or the limit is unknown; one at or above the limit is ignored.
  */
 export function effectiveBudget(limit: number, budget: number): number {
-  return budget > 0 && !(limit > 0 && limit < budget) ? budget : 0;
+  return budget > 0 && !(limit > 0 && limit <= budget) ? budget : 0;
 }
 
 /**

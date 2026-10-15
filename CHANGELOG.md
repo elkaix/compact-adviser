@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.1.13](https://github.com/kunchenguid/compact-adviser/compare/compact-adviser-v0.1.12...compact-adviser-v0.1.13) (2026-10-09)
+
+
+### Features
+
+* **claude-mod:** run optional prompt before automatic compaction ([#69](https://github.com/kunchenguid/compact-adviser/issues/69)) ([28be11c](https://github.com/kunchenguid/compact-adviser/commit/28be11c0e565b89f7f29ea1873f5cccfdcebb0fe))
+
+## [0.1.12](https://github.com/kunchenguid/compact-adviser/compare/compact-adviser-v0.1.11...compact-adviser-v0.1.12) (2026-10-02)
+
+
+### Features
+
+* add an optional context budget for the hint floor ([#65](https://github.com/kunchenguid/compact-adviser/issues/65)) ([2e90535](https://github.com/kunchenguid/compact-adviser/commit/2e9053503cf5906f819ae8b6ca519fc94819db89))
+
+## [0.1.11](https://github.com/kunchenguid/compact-adviser/compare/compact-adviser-v0.1.10...compact-adviser-v0.1.11) (2026-09-29)
+
+
+### Bug Fixes
+
+* require https for TYPESAFE_BASE except on loopback hosts ([#62](https://github.com/kunchenguid/compact-adviser/issues/62)) ([a73995f](https://github.com/kunchenguid/compact-adviser/commit/a73995f775695859547682f99b463c0b29941ebc))
+
 ## [0.1.10](https://github.com/kunchenguid/compact-adviser/compare/compact-adviser-v0.1.9...compact-adviser-v0.1.10) (2026-09-29)
 
 

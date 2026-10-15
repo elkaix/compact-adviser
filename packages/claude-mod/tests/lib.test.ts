@@ -55,10 +55,10 @@ const rows = (mode: unknown, minimum: unknown) => [
 ];
 
 describe("settings", () => {
-  test("a budget is a whole number of tokens, and off or default clears it", () => {
+  test("a budget is a whole number of tokens, and off clears it", () => {
     expect(parseBudget(" 450000 ")).toBe(450000);
     expect(parseBudget("off")).toBe(0);
-    expect(parseBudget("default")).toBe(0);
+    expect(() => parseBudget("default")).toThrow("whole number");
     for (const bad of ["", "-1", "1.5", "450k", "4e5", "9007199254740992"]) {
       expect(() => parseBudget(bad)).toThrow("whole number");
     }
@@ -100,6 +100,7 @@ describe("settings", () => {
       contextBudgetTokens: 0,
       autoAcknowledged: false,
       logRequests: false,
+      beforeCompactPrompt: "",
     });
     expect(
       readConfig(rows("auto", 60000), {
@@ -113,7 +114,15 @@ describe("settings", () => {
       contextBudgetTokens: 0,
       autoAcknowledged: true,
       logRequests: false,
+      beforeCompactPrompt: "",
     });
+    const prompt = (value: unknown) => [
+      ...rows("hint", 40000),
+      { key: "compact-adviser.beforeCompactPrompt", value },
+    ];
+    expect(readConfig(prompt("  /stow  "), undefined).beforeCompactPrompt).toBe("/stow");
+    expect(readConfig(prompt(""), undefined).beforeCompactPrompt).toBe("");
+    expect(() => readConfig(prompt(12), undefined)).toThrow("before-compact prompt");
   });
 
   test("unreadable rows or consent records are reported, never replaced by permissive values", () => {

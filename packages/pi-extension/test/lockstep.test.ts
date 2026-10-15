@@ -69,6 +69,13 @@ test("the question set and the floor schedule match", () => {
     assert.equal(other.MAX_REQUEST_BYTES, pi.MAX_REQUEST_BYTES);
   }
   assert.deepEqual(Object.keys(pi.QUESTIONS), ["done", "shape"]);
+  // A budget only relaxes the floor: below the limit it is the denominator, at or above it is ignored.
+  // Every host ships this same checkpoint.ts, pinned byte for byte below.
+  assert.equal(checkpoint.contextPressure(300000, 1000000, 450000), 300000 / 450000);
+  assert.equal(checkpoint.contextPressure(300000, 400000, 450000), 300000 / 400000);
+  assert.equal(checkpoint.effectiveBudget(450000, 450000), 0);
+  assert.equal(checkpoint.contextPressure(300000, Number.NaN, 450000), 300000 / 450000);
+  assert.ok(Number.isNaN(checkpoint.contextPressure(300000, Number.NaN, 0)));
   assert.equal(pi.USAGE_STRICT_UNTIL, 0.1);
   assert.equal(pi.USAGE_LOOSE_AT, 0.9);
   assert.equal(pi.FLOOR_MIN, 0.5);
@@ -662,7 +669,7 @@ test("a context budget only relaxes the floor, on every host", () => {
     [45000, 272000, 50000, 45000 / 50000, 50000],
     // A budget above the host's limit leaves the limit in charge.
     [160000, 167000, 450000, 160000 / 167000, 0],
-    [160000, 450000, 450000, 160000 / 450000, 450000],
+    [160000, 450000, 450000, 160000 / 450000, 0],
     // An unknown limit takes the budget; without either, usage is unknown.
     [160000, Number.NaN, 450000, 160000 / 450000, 450000],
     [5, 0, 100, 0.05, 100],

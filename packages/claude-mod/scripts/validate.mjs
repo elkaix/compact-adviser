@@ -8,8 +8,9 @@ const { status, output: raw } = run(["plugin", "validate", "--strict", PACKAGE])
 // 2.1.282 quotes hook filter values (`{key="…"}`) where 2.1.275 prints them bare; compare the
 // bare form so the check pins what is hooked, not how a given host version spells it.
 const output = raw.replace(/\{(\w+)="([^"]*)"\}/g, "{$1=$2}");
+const hooks =
+  "hooks: session.start, prompt.submit, command.run, turn.start, turn.complete, session.compact, turn.step, command.run{command=compact-adviser}, config.describe{key=compact-adviser.typesafeApiKey}, ui.close{id=compact-adviser}, ui.render{component=Pane}";
 const expected = [
-  "hooks: session.start, turn.start, turn.complete, session.compact, turn.step, command.run{command=compact-adviser}, config.describe{key=compact-adviser.typesafeApiKey}, ui.close{id=compact-adviser}, ui.render{component=Pane}",
   "env reads: CLAUDE_CODE_ENABLE_FUNCTION_HOOKS, COMPACT_ADVISER_DISABLE, COMPACT_ADVISER_TEST_ENDPOINT, HOME, TYPESAFE_API_KEY, TYPESAFE_BASE",
   "env writes: nothing",
   "$.fs.exists (via appendTypeSafeLog, resumeLogPart)",
@@ -18,9 +19,14 @@ const expected = [
   "$.fs.write (via appendTypeSafeLog)",
   "Validation passed",
 ];
-const forbidden = ["process.run", "env.set", "prompt.submit", "prompt.fill", "tool.call", "model."];
+// `prompt.submit` is intentional: confirmed auto mode may submit `beforeCompactPrompt`.
+// A leading slash is `command.run` instead; Claude Code rejects that text on prompt.submit.
+const forbidden = ["process.run", "env.set", "prompt.fill", "tool.call", "model."];
 const problems = [
   ...(status === 0 ? [] : [`exit status ${status}`]),
+  ...(output.includes(hooks)
+    ? []
+    : [`missing hooks line (prompt.submit, and the other registered events)`]),
   ...expected.filter((line) => !output.includes(line)).map((line) => `missing: ${line}`),
   ...forbidden
     .filter((call) => output.includes(`$.${call}`))

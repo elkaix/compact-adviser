@@ -15,7 +15,11 @@
 //   cooldown depends on lives in `$.store`.
 // - `$.session.compact` runs through every hook but the caller's, so this module's own
 //   `session.compact` hook never sees its own automatic compaction; that path resets the
-//   session's counters itself.
+//   session's counters itself. It rejects while a turn is running; call it from
+//   `turn.complete` or later.
+// - `$.prompt.submit` rejects text that starts with `/` and does not expand slash commands
+//   or `@file` mentions (verified on Claude Code 2.1.294). A before-compact value that
+//   starts with `/` is run with `$.command.run` instead. Example value: `/stow`.
 import type { EngineInterface, PluginOptions, Register, RenderChildren } from "claude-code";
 import {
   COOLDOWN_TEXT,
@@ -39,6 +43,7 @@ import {
   MINIMUM_KEY,
   MODE_KEY,
   type Mode,
+  PLUGIN,
   parseBudget,
   parseConsent,
   parseMinimum,
@@ -88,6 +93,11 @@ const PANE_ID = "compact-adviser";
 const HINT = "work appears completed or recorded. Run /compact to save tokens.";
 const COMPACT_INSTRUCTIONS =
   "The session reached a natural boundary; keep the current work, pending tasks, referenced files, and the next step exact.";
+const BEFORE_COMPACT_STATUS = "running the before-compact prompt…";
+/** A before-compact turn that outlives this does not compact. */
+export const BEFORE_COMPACT_TIMEOUT_MS = 300_000;
+const BEFORE_COMPACT_RETRY_MS = 60_000;
+const SLASH_COMMAND = /^\/([A-Za-z0-9_:-]{1,64})(?:\s+([\s\S]*))?$/;
 const PENDING_NOTICE_KEY = "pendingNotice";
 const LOOPBACK_ENDPOINT = /^http:\/\/127\.0\.0\.1:\d{1,5}\/[\x21-\x7e]*$/;
 const USAGE =
@@ -155,6 +165,27 @@ let logPartResume: Promise<void> | undefined;
 // the post-compaction baseline (the turn end's is later, and a long first turn inflates it).
 let baselinePending = false;
 let hintVisible = false;
+// A confirmed auto checkpoint that submitted a prompt and is waiting to compact after it.
+let beforeCompact:
+  | {
+      seq: number;
+      key: string;
+      judgedTokens: number;
+      fingerprint: string;
+      turnId?: string;
+      /** True once this handoff has asked the host to start its turn. */
+      dispatched?: boolean;
+    }
+  | undefined;
+let beforeCompactSeq = 0;
+// The running turn of a handoff abandoned after it started; its end is not a checkpoint.
+let abandonedTurn: { turnId: string; key: string } | undefined;
+// Dispatched, then abandoned before its turn started. turn.start carries no origin, so
+// the next turn is that submission unless a later prompt or command claimed it.
+let abandonedDispatch: { key: string } | undefined;
+// A prompt or command from anyone but this plugin was submitted and its turn has not
+// started yet.
+let foreignSubmitted = false;
 let diagnostic = "";
 // What the latest settled turn end came to, for `/compact-adviser status` only.
 let lastCheck: TurnEnd | undefined;
@@ -400,6 +431,158 @@ async function ineligibility(
   return undefined;
 }
 
+function ownSubmission(origin: { kind: string; name?: string } | undefined): boolean {
+  return origin?.kind === "plugin" && origin.name === PLUGIN;
+}
+
+/** A leading slash is a command name, not model text. Anything else is not a command. */
+function slashInvocation(text: string): { command: string; args?: string } | undefined {
+  const match = SLASH_COMMAND.exec(text.trim());
+  const command = match?.[1];
+  if (!command) return undefined;
+  const args = match?.[2]?.trim();
+  return args ? { command, args } : { command };
+}
+
+/** Applies the same one-minute retry the compaction-failure path uses. */
+async function deferRetry($: EngineInterface, key: string): Promise<void> {
+  try {
+    const { state } = await loadState($);
+    const now = await $.clock.now();
+    await $.store.set(key, {
+      ...state,
+      retryAfter: now + BEFORE_COMPACT_RETRY_MS,
+      updatedAt: now,
+    });
+  } catch {
+    // The cooldown record stays as it was; the next judgment re-reads it.
+  }
+}
+
+/**
+ * Drops the pending before-compact handoff and defers the next judgment, so neither the
+ * checkpoint nor the abandoned prompt's own turn, if it already started, is judged.
+ */
+async function abandonBeforeCompact($: EngineInterface, message?: string): Promise<void> {
+  const handoff = beforeCompact;
+  if (!handoff) return;
+  beforeCompact = undefined;
+  if (handoff.turnId !== undefined) {
+    abandonedTurn = { turnId: handoff.turnId, key: handoff.key };
+  } else if (handoff.dispatched) {
+    abandonedDispatch = { key: handoff.key };
+  }
+  clearStatus($);
+  if (message) notice($, message);
+  await deferRetry($, handoff.key);
+}
+
+async function submitBeforeCompact($: EngineInterface, text: string): Promise<void> {
+  const trimmed = text.trim();
+  if (trimmed.startsWith("/")) {
+    const slash = slashInvocation(trimmed);
+    if (!slash) {
+      throw new Error("before-compact prompt starts with / but is not a slash command");
+    }
+    await $.command.run(slash);
+    return;
+  }
+  await $.prompt.submit({ text: trimmed });
+}
+
+/** Submits the configured text and waits for its turn to end before compacting. */
+async function armBeforeCompact(
+  $: EngineInterface,
+  key: string,
+  text: string,
+  epoch: number,
+  judgedTokens: number,
+  fingerprint: string,
+): Promise<void> {
+  if (epoch !== generation || compactions > 0 || beforeCompact || foreignSubmitted) return;
+  const seq = ++beforeCompactSeq;
+  beforeCompact = { seq, key, judgedTokens, fingerprint, dispatched: false };
+  $.ui.status(BEFORE_COMPACT_STATUS);
+  $.clock.after(BEFORE_COMPACT_TIMEOUT_MS, () => {
+    if (beforeCompact?.seq !== seq) return;
+    void abandonBeforeCompact($, "The before-compact prompt timed out. Context left unchanged.");
+  });
+  try {
+    if (beforeCompact?.seq === seq) beforeCompact.dispatched = true;
+    await submitBeforeCompact($, text);
+  } catch {
+    if (beforeCompact?.seq !== seq) return;
+    beforeCompact.dispatched = false;
+    await abandonBeforeCompact($, "The before-compact prompt did not run. Context left unchanged.");
+  }
+}
+
+/**
+ * Runs the host compaction path for a judged checkpoint. Call only between turns.
+ * The counter goes up before the first await, so a caller's last identity check holds.
+ */
+async function compactNow(
+  $: EngineInterface,
+  key: string,
+  epoch: number,
+  judgedTokens: number,
+  fingerprint: string,
+): Promise<void> {
+  if (epoch !== generation || compactions > 0) return;
+  compactions++;
+  // A status line, not a toast: the host drops a toast within two seconds of the last,
+  // which would swallow the completion notice of a quick compaction.
+  $.ui.status("compacting at a checkpoint (experimental auto)…");
+  let failure: string | undefined;
+  let tokens: { before?: number; after?: number } = {};
+  try {
+    const compacted = await $.session.compact({ instructions: COMPACT_INSTRUCTIONS });
+    if (compacted.skip !== undefined) failure = compacted.skip;
+    else tokens = { before: compacted.tokensBefore, after: compacted.tokensAfter };
+  } catch (error) {
+    failure = error instanceof Error ? error.message : String(error);
+  } finally {
+    compactions--;
+  }
+  const after = await $.clock.now();
+  if (failure !== undefined && epoch !== generation) {
+    // The host refuses a compaction once a turn runs: stale work, not a failure to report.
+    clearStatus($);
+    return;
+  }
+  if (failure !== undefined) {
+    note(epoch, "compaction-failed");
+    const { state: latestState } = await loadState($);
+    // A compaction that did not happen did not act: the re-ask gate holds this checkpoint.
+    if (epoch === generation) {
+      await $.store.set(key, {
+        ...judged(latestState, "wait", judgedTokens, fingerprint),
+        retryAfter: after + BEFORE_COMPACT_RETRY_MS,
+        updatedAt: after,
+      });
+    }
+    notice(
+      $,
+      "Compaction failed or was cancelled. No immediate retry; Claude Code remains in control.",
+    );
+    clearStatus($);
+    return;
+  }
+  note(epoch, "compact");
+  generation++;
+  await $.store.set(key, initialState(true, after));
+  baselinePending = true;
+  const completed =
+    tokens.before !== undefined && tokens.after !== undefined
+      ? `compaction completed: ${formatTokens(tokens.before)} to ${formatTokens(tokens.after)} tokens.`
+      : "compaction completed.";
+  // The dim transcript line (never sent to the model) records the automatic action even
+  // when the host throttles the toast. Claude Code prefixes $.ui.log with the plugin name.
+  $.ui.log(`automatic ${completed}`);
+  $.ui.toast(completed);
+  clearStatus($);
+}
+
 /**
  * Records what a turn end came to, but only while that turn is still the latest: a judgment
  * that returns after a newer turn has settled must not replace that turn's own reason.
@@ -560,60 +743,15 @@ async function judgeCheckpoint($: EngineInterface, epoch: number): Promise<void>
       $.ui.status(HINT);
       return;
     }
-    // No await between this last identity check and the compaction request.
-    if (epoch !== generation || compactions > 0) return;
-    compactions++;
-    // A status line, not a toast: the host drops a toast within two seconds of the last,
-    // which would swallow the completion notice of a quick compaction.
-    $.ui.status("compacting at a checkpoint (experimental auto)…");
-    let failure: string | undefined;
-    let tokens: { before?: number; after?: number } = {};
-    try {
-      const compacted = await $.session.compact({ instructions: COMPACT_INSTRUCTIONS });
-      if (compacted.skip !== undefined) failure = compacted.skip;
-      else tokens = { before: compacted.tokensBefore, after: compacted.tokensAfter };
-    } catch (error) {
-      failure = error instanceof Error ? error.message : String(error);
-    } finally {
-      compactions--;
-    }
-    const after = await $.clock.now();
-    if (failure !== undefined && epoch !== generation) {
-      // The host refuses a compaction once a turn runs: stale work, not a failure to report.
-      clearStatus($);
+    // No await between this last identity check and the compaction request, unless a
+    // before-compact prompt has to run first. That path compacts from the submitted
+    // turn's end, not from here.
+    if (epoch !== generation || compactions > 0 || beforeCompact) return;
+    if (latest.beforeCompactPrompt.trim()) {
+      await armBeforeCompact($, key, latest.beforeCompactPrompt, epoch, judgedTokens, fingerprint);
       return;
     }
-    if (failure !== undefined) {
-      note(epoch, "compaction-failed");
-      const { state: latestState } = await loadState($);
-      // A compaction that did not happen did not act: the re-ask gate holds this checkpoint.
-      if (epoch === generation) {
-        await $.store.set(key, {
-          ...judged(latestState, "wait", judgedTokens, fingerprint),
-          retryAfter: after + 60000,
-          updatedAt: after,
-        });
-      }
-      notice(
-        $,
-        "Compaction failed or was cancelled. No immediate retry; Claude Code remains in control.",
-      );
-      clearStatus($);
-      return;
-    }
-    note(epoch, "compact");
-    generation++;
-    await $.store.set(key, initialState(true, after));
-    baselinePending = true;
-    const completed =
-      tokens.before !== undefined && tokens.after !== undefined
-        ? `compaction completed: ${formatTokens(tokens.before)} to ${formatTokens(tokens.after)} tokens.`
-        : "compaction completed.";
-    // The dim transcript line (never sent to the model) records the automatic action even
-    // when the host throttles the toast. Claude Code prefixes $.ui.log with the plugin name.
-    $.ui.log(`automatic ${completed}`);
-    $.ui.toast(completed);
-    clearStatus($);
+    await compactNow($, key, epoch, judgedTokens, fingerprint);
   } finally {
     judging = false;
     const waiting = pendingEpoch;
@@ -969,6 +1107,10 @@ export const register: Register = (on, options) => {
     lastCheck = undefined;
     logProblem = undefined;
     logPart = 1;
+    beforeCompact = undefined;
+    abandonedTurn = undefined;
+    abandonedDispatch = undefined;
+    foreignSubmitted = false;
     await $.command.register({
       name: COMMAND,
       description: "Configure persistent compaction advice, experimental auto, and token minimum",
@@ -989,14 +1131,82 @@ export const register: Register = (on, options) => {
     return next(e);
   });
 
+  // Anyone's prompt or command but this module's own abandons a pending handoff, and the
+  // turn it starts is never taken for the handoff's.
+  on("prompt.submit", async ($, e, next) => {
+    if ((await isActivated($)) && !ownSubmission(e.origin)) {
+      foreignSubmitted = true;
+      if (beforeCompact) await abandonBeforeCompact($);
+      else abandonedDispatch = undefined;
+    }
+    return next(e);
+  }).catch((_$, e, next) => next(e));
+
+  on("command.run", async ($, e, next) => {
+    if ((await isActivated($)) && !ownSubmission(e.origin)) {
+      foreignSubmitted = true;
+      if (beforeCompact) await abandonBeforeCompact($);
+      else abandonedDispatch = undefined;
+    }
+    return next(e);
+  });
+
   on("turn.start", async ($, e, next) => {
-    if (await isActivated($)) await invalidate($);
+    if (await isActivated($)) {
+      if (abandonedDispatch) {
+        abandonedTurn = { turnId: e.turnId, key: abandonedDispatch.key };
+        abandonedDispatch = undefined;
+        foreignSubmitted = false;
+        await invalidate($);
+        return next(e);
+      }
+      const foreign = foreignSubmitted;
+      foreignSubmitted = false;
+      const handoff = beforeCompact;
+      if (handoff && handoff.turnId === undefined && !foreign) {
+        handoff.turnId = e.turnId;
+        return next(e);
+      }
+      await invalidate($);
+      await abandonBeforeCompact($);
+    }
     return next(e);
   });
 
   on("turn.complete", async ($, e, next) => {
     const result = await next(e);
     if (!(await isActivated($)) || !interactive) return result;
+    const abandoned = abandonedTurn;
+    if (abandoned && e.agentId === undefined && abandoned.turnId === e.turnId) {
+      abandonedTurn = undefined;
+      await deferRetry($, abandoned.key);
+      return result;
+    }
+    const handoff = beforeCompact;
+    if (handoff && e.agentId === undefined && handoff.turnId === e.turnId) {
+      beforeCompact = undefined;
+      if (e.reason === "answer" && !e.isAborted && e.answer.trim()) {
+        const key = handoff.key;
+        const epoch = generation;
+        $.clock.after(0, () => {
+          if (epoch !== generation || foreignSubmitted) {
+            clearStatus($);
+            return;
+          }
+          void compactNow($, key, epoch, handoff.judgedTokens, handoff.fingerprint).catch(() =>
+            notice(
+              $,
+              "Compact adviser could not compact after the before-compact prompt; context left unchanged.",
+            ),
+          );
+        });
+        return result;
+      }
+      clearStatus($);
+      await deferRetry($, handoff.key);
+      notice($, "The before-compact turn did not finish cleanly. Context left unchanged.");
+      return result;
+    }
     if (e.agentId !== undefined) return result;
     if (e.reason !== "answer" || e.isAborted || !e.answer.trim()) {
       lastCheck = e.isAborted ? "interrupted" : "no-answer";
@@ -1028,6 +1238,7 @@ export const register: Register = (on, options) => {
     if (result.skip !== undefined) return result;
     await invalidate($);
     try {
+      await abandonBeforeCompact($);
       const key = sessionKey(await $.session.id());
       await $.store.set(key, initialState(true, await $.clock.now()));
       baselinePending = true;
